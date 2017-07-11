@@ -5,6 +5,9 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
 
+extern crate fnv;
+use fnv::FnvHashSet;
+
 type SIndex = u16;
 
 #[derive(PartialEq)]
@@ -14,19 +17,10 @@ struct HeapItem {
 }
 
 impl HeapItem {
-    fn new(min_total_dist: f32) -> HeapItem {
+    fn new(path: Vec<SIndex>, min_total_dist: f32) -> HeapItem {
         HeapItem {
             distance: min_total_dist,
-            path: Vec::new(),
-        }
-    }
-
-    fn split(&self, new_item: SIndex, dist_diff: f32) -> HeapItem {
-        let mut new_path = self.path.clone();
-        new_path.push(new_item);
-        HeapItem {
-            distance: self.distance + dist_diff,
-            path: new_path,
+            path: path,
         }
     }
 }
@@ -46,6 +40,19 @@ impl PartialOrd<HeapItem> for HeapItem {
     }
 }
 
+fn bloom_set_hash<I: Iterator<Item = u16>>(it: I) -> u64 {
+    // Modified FNV (Fowler–Noll–Vo) hash.
+    // Designed to be order independent.
+    let mut out = 0;
+    for i in it {
+        let mut hash = 0xcbf29ce484222325;
+        hash = (hash ^ ((i & 0xff) as u64)).wrapping_mul(0x100000001b3);
+        hash = (hash ^ ((i >> 8) as u64)).wrapping_mul(0x100000001b3);
+        out ^= hash;
+    }
+    out
+}
+
 fn main() {
     let mut args = env::args();
     args.next();
@@ -54,10 +61,9 @@ fn main() {
     let mut buffer = String::new();
     let mut r_items = Vec::new();
     let mut s_items = Vec::new();
+    let mut s_indicies = Vec::new();
     let mut distances = Vec::new();
-    let mut file_idx_rs = Vec::new();
     let mut is_header = true;
-    let mut min_distance = f32::INFINITY;
     loop {
         buffer.clear();
         file.read_line(&mut buffer).expect("Failed to read file");
@@ -77,55 +83,60 @@ fn main() {
         });
         if is_header {
             is_header = false;
-            let mut len = 0;
-            for item in items {
-                len += 1;
+            for (i, item) in items.into_iter().enumerate() {
                 if item.starts_with('R') {
                     r_items.push(String::from(item));
-                    file_idx_rs.push(Some(false));
                 } else if item.starts_with('S') {
                     s_items.push(String::from(item));
-                    file_idx_rs.push(Some(true));
-                } else {
-                    file_idx_rs.push(None);
+                    s_indicies.push(i);
                 }
             }
-            distances.resize(len, Vec::new());
+            distances.resize(r_items.len(), Vec::new());
         } else {
             let item = match items.next() {
                 Some(x) => x,
                 None => continue,
             };
-            let index = match r_items.iter().position(|x| x == &item) {
-                Some(x) => x,
-                None => continue,
-            };
-            let is_s = item.starts_with('S');
-            distances[index] = items
-                .map(str::parse)
-                .enumerate()
-                .filter_map(|(i, x)| {
-                    let x = x.expect("Failed to parse distance");
-                    if let Some(is_other_s) = file_idx_rs[i] {
-                        if is_s != is_other_s {
-                            if x < min_distance {
-                                min_distance = x;
-                            }
-                            return Some(x);
-                        }
-                    }
-                    None
-                })
-                .collect::<Vec<f32>>();
+            if item.starts_with('R') {
+                let index = match r_items.iter().position(|x| x == &item) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let items = items.map(str::parse).collect::<Result<Vec<f32>, _>>().expect("Failed to parse float");
+                let ref mut distances = distances[index];
+                for &idx in s_indicies.iter() {
+                    distances.push(items[idx]);
+                }
+            }
         }
+    }
+    let mut r_best_s = Vec::new();
+    let mut min_step_distance = vec![f32::INFINITY; r_items.len()];
+    for i in 0..r_items.len() {
+        const N_S: usize = 10;
+        let mut distances = distances[i].iter().cloned().enumerate().collect::<Vec<_>>();
+        distances.sort_by(|&(_, x), &(_, y)| x.partial_cmp(&y).expect("NaN in file"));
+        r_best_s.push(distances.into_iter()
+                      .take(N_S)
+                      .map(|(n, x)| {
+                          if x < min_step_distance[i] {
+                              min_step_distance[i] = x;
+                          }
+                          (n, x)
+                      })
+                      .map(|(i, _)| i as SIndex)
+                      .collect::<Vec<_>>());
     }
     if s_items.len() > (SIndex::max_value() as usize) {
         panic!("There are {} S_ items, but only {} can be indexed", s_items.len(), SIndex::max_value());
     }
+    let mut max_explored = 0;
+    let mut tried_paths: FnvHashSet<u64> = Default::default();
     let mut heap = BinaryHeap::new();
-    heap.push(HeapItem::new(min_distance * (r_items.len() as f32)));
-    while let Some(item) = heap.pop() {
-        if item.path.len() >= r_items.len() {
+    heap.push(HeapItem::new(Vec::new(), min_step_distance.iter().sum()));
+    while let Some(mut item) = heap.pop() {
+        let path_len = item.path.len();
+        if path_len >= r_items.len() {
             // Done!
             let max_r_len = r_items.iter().map(String::len).max().expect("No R items");
             let max_s_len = s_items.iter().map(String::len).max().expect("No S items");
@@ -135,11 +146,38 @@ fn main() {
             println!("{}", (0..max_r_len + max_s_len + 15).map(|_| '-').collect::<String>());
             println!("Total distance:{:>1$.6}", item.distance, max_r_len + max_s_len);
             break;
+        } else if path_len > max_explored {
+            max_explored = path_len;
+            println!("Explored depth: {:>3}% ({:>s_w$}/{})", (100*path_len)/r_items.len(), path_len, r_items.len(), s_w = (r_items.len() as f32).log(10.).floor() as usize + 1);
         }
-        for i in 0..s_items.len() {
-            if !item.path.contains(&(i as u16)) {
-                let dist = distances[item.path.len()][i];
-                heap.push(item.split(i as u16, dist - min_distance));
+        if !tried_paths.insert(bloom_set_hash(item.path.iter().cloned())) {
+            continue;
+        }
+        if !item.path.is_empty() {
+            let idx = path_len - 1;
+            let prev_s_i = *item.path.last().unwrap();
+            let prev_dist = distances[idx][prev_s_i as usize];
+            let mut s_iter = r_best_s[idx].iter();
+            let _ = s_iter.find(|&&x| x == prev_s_i);
+            let mut new_path = item.path.clone();
+            for &s_i in s_iter {
+                *new_path.last_mut().unwrap() = s_i;
+                if !tried_paths.contains(&bloom_set_hash(new_path.iter().cloned())) {
+                    let dist_diff = distances[idx][s_i as usize] - prev_dist;
+                    heap.push(HeapItem::new(new_path, item.distance + dist_diff));
+                    break;
+                }
+            }
+        }
+        item.path.push(0);
+        for &s_i in r_best_s[path_len].iter() {
+            if !item.path[..path_len].contains(&(s_i as u16)) {
+                *item.path.last_mut().unwrap() = s_i;
+                if !tried_paths.contains(&bloom_set_hash(item.path.iter().cloned())) {
+                    let dist_diff = distances[path_len][s_i as usize] - min_step_distance[path_len];
+                    heap.push(HeapItem::new(item.path, item.distance + dist_diff));
+                    break;
+                }
             }
         }
     }
